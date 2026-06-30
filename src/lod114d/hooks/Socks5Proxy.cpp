@@ -7,9 +7,13 @@
 //
 #include <Windows.h>
 #include <detours/detours.h>
+#include <fmt/format.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -19,7 +23,9 @@
 #include <string_view>
 #include <vector>
 
+#include "components/config/AppConfig.h"
 #include "components/proxy/ProxyBypass.h"
+#include "game/GameHelpers.h"
 #include "game/LaunchOptions.h"
 #include "utils/utils.h"
 
@@ -64,7 +70,61 @@ std::shared_ptr<spdlog::logger> logger;  // dedicated "socks5" logger; created i
 std::optional<ProxyConfig> config;         // parsed once in Install(), before the hook goes live
 std::mutex resolveMutex;                   // guards resolvedProxy
 std::optional<sockaddr_in> resolvedProxy;  // proxy endpoint, resolved lazily and cached
+std::atomic<uint64_t> eventSeq{0};         // monotonic per-process id for emitted proxy-log events
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
+// NOLINTNEXTLINE(readability-identifier-naming) - 'json' is nlohmann's conventional alias spelling
+using json = nlohmann::json;
+
+// schemaVersion of the proxy-log wire contract (manager-side D2BSMessageHandler "proxyLog").
+constexpr int PROXY_LOG_SCHEMA_VERSION = 1;
+
+// Push a single structured per-connection event to the D2BotNG manager via the
+// same WM_COPYDATA envelope the character-state feed uses ({profile, func, args:[json]}).
+// Fire-and-forget: if no manager handle has been registered yet (early BNCS connect
+// before the manager's "Handle" IPC), the event is simply dropped - the next connect
+// in the same game (realm / D2GS / BnFTP) still reports. Never throws into the hook.
+void EmitProxyEvent(std::string_view phase, const sockaddr_in& dest, std::optional<int64_t> durationMs,
+                    std::string_view error) {
+    if (!config) {
+        return;
+    }
+    const auto managerHandle = config::GetAppConfig().managerHandle.load(std::memory_order_relaxed);
+    if (managerHandle == 0) {
+        return;  // no manager target yet - nowhere to send
+    }
+
+    std::array<char, INET_ADDRSTRLEN> ipBuf{};
+    const char* ip = inet_ntop(AF_INET, &dest.sin_addr, ipBuf.data(), ipBuf.size());
+
+    const auto now = std::chrono::system_clock::now();
+
+    json evt = json::object();
+    evt["schemaVersion"] = PROXY_LOG_SCHEMA_VERSION;
+    evt["seq"] = eventSeq.fetch_add(1, std::memory_order_relaxed);
+    evt["ts"] = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    evt["pid"] = static_cast<uint32_t>(GetCurrentProcessId());
+    evt["proxy"] = fmt::format("{}:{}", config->host, config->port);
+    evt["event"] = std::string(phase);
+    evt["destHost"] = ip != nullptr ? std::string(ip) : std::string{};
+    evt["destPort"] = ntohs(dest.sin_port);
+    // The game resolves its own DNS, so CMD CONNECT is always issued IPv4 (ATYP=0x01);
+    // surfaced verbatim so the manager can label IPv4-vs-remote-DNS without guessing.
+    evt["atyp"] = "ipv4";
+    if (durationMs) {
+        evt["durationMs"] = *durationMs;
+    }
+    if (!error.empty()) {
+        evt["error"] = std::string(error);
+    }
+
+    json envelope = json::object();
+    envelope["profile"] = config::GetAppConfig().GetProfileName();
+    envelope["func"] = "proxyLog";
+    envelope["args"] = json::array({evt.dump(-1, ' ', false, json::error_handler_t::replace)});
+
+    game::SendIPC(0, envelope.dump(-1, ' ', false, json::error_handler_t::replace), managerHandle);
+}
 
 // Parse socks5://[user[:password]@]host:port. Returns nullopt on anything that
 // is not a well-formed socks5 URL with both a host and a port.
@@ -326,23 +386,43 @@ int WSAAPI HookedConnect(SOCKET s, const sockaddr* name, int namelen) {
         return realConnect(s, name, namelen);
     }
 
+    sockaddr_in dest{};
+    std::memcpy(&dest, name, sizeof(dest));
+
+    // Per-connection telemetry for the manager's Proxies tab. Emitted before the
+    // (potentially blocking) handshake so the connection shows up "in progress",
+    // then resolved to established/failed below. Connections are infrequent
+    // (login / realm / game join), so the synchronous WM_COPYDATA cost is negligible.
+    const auto start = std::chrono::steady_clock::now();
+    const auto elapsedMs = [&start]() -> int64_t {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+            .count();
+    };
+    EmitProxyEvent("connect", dest, std::nullopt, {});
+
     const auto proxy = ResolveProxy();
     if (!proxy) {
         // Configured but unresolvable: fail the connect rather than fall back to a
         // direct one. A direct connection would defeat the entire point of -proxy.
         logger->error("cannot resolve proxy {}:{}; failing connect", config->host, config->port);
+        EmitProxyEvent("failed", dest, elapsedMs(), "proxy DNS resolution failed");
         WSASetLastError(WSAECONNREFUSED);
         return SOCKET_ERROR;
     }
 
-    sockaddr_in dest{};
-    std::memcpy(&dest, name, sizeof(dest));
-
-    if (!ProxyConnect(s, *proxy) || !Handshake(s, *config, dest)) {
-        logger->warn("tunnel via {}:{} failed", config->host, config->port);
+    if (!ProxyConnect(s, *proxy)) {
+        logger->warn("tunnel via {}:{} failed (proxy connect)", config->host, config->port);
+        EmitProxyEvent("failed", dest, elapsedMs(), "proxy connect failed");
         WSASetLastError(WSAECONNREFUSED);
         return SOCKET_ERROR;
     }
+    if (!Handshake(s, *config, dest)) {
+        logger->warn("tunnel via {}:{} failed (socks5 handshake)", config->host, config->port);
+        EmitProxyEvent("failed", dest, elapsedMs(), "socks5 handshake failed");
+        WSASetLastError(WSAECONNREFUSED);
+        return SOCKET_ERROR;
+    }
+    EmitProxyEvent("established", dest, elapsedMs(), {});
     return 0;  // tunnel established; the socket is now wired through to dest
 }
 
