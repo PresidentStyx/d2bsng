@@ -18,6 +18,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "components/proxy/ProxyBypass.h"
@@ -31,6 +32,8 @@ namespace d2bs::hooks::socks5 {
 namespace {
 
 using ConnectFn = int(WSAAPI*)(SOCKET, const sockaddr*, int);
+using GetAddrInfoFn = int(WSAAPI*)(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA*);
+using GetHostByNameFn = hostent*(WSAAPI*)(const char*);
 
 // Bound every blocking step of the handshake. The game's own BNCS socket carries a
 // 3s SO_RCVTIMEO, so this is only the outer ceiling for the proxy itself.
@@ -59,13 +62,52 @@ struct ProxyConfig {
 
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables) - hook owns module-level state by definition
 ConnectFn realConnect = nullptr;  // set in Install(); Detours rewrites it to the trampoline (original connect)
+GetAddrInfoFn realGetAddrInfo = nullptr;     // trampoline to the original getaddrinfo
+GetHostByNameFn realGetHostByName = nullptr; // trampoline to the original gethostbyname
 bool installed = false;
 std::shared_ptr<spdlog::logger> logger;  // dedicated "socks5" logger; created in Install() once the sinks are wired
 
 std::optional<ProxyConfig> config;         // parsed once in Install(), before the hook goes live
 std::mutex resolveMutex;                   // guards resolvedProxy
 std::optional<sockaddr_in> resolvedProxy;  // proxy endpoint, resolved lazily and cached
+
+// Remote-DNS support. The game resolves Battle.net hostnames locally, then connects
+// by IP - so the SOCKS5 proxy never gets to pick a server in *its* region, and the
+// bot can be steered onto a gateway whose version-check/download node is unreachable
+// from the proxy. We mirror Proxifier's remote DNS: detour the resolvers to remember
+// every IP->hostname mapping, then send ATYP=DOMAIN (the hostname) in the SOCKS5
+// CONNECT so the proxy re-resolves it locally. Numeric "hostnames" are not recorded.
+std::mutex hostMapMutex;
+std::unordered_map<uint32_t, std::string> ipToHost;  // key: IPv4 in network byte order
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
+
+// True if `s` is a dotted-quad / numeric literal rather than a real hostname; we must
+// not "remote-resolve" those (sending a numeric ATYP=DOMAIN defeats the purpose).
+bool IsNumericHost(const char* s) {
+    if (s == nullptr || *s == '\0') {
+        return true;
+    }
+    in_addr v4{};
+    in6_addr v6{};
+    return InetPtonA(AF_INET, s, &v4) == 1 || InetPtonA(AF_INET6, s, &v6) == 1;
+}
+
+void RememberHost(uint32_t ipNetOrder, const char* host) {
+    if (IsNumericHost(host)) {
+        return;
+    }
+    const std::scoped_lock lock(hostMapMutex);
+    ipToHost[ipNetOrder] = host;
+}
+
+// Reverse-lookup the hostname the game resolved for this IPv4 (empty if none/numeric).
+std::string HostForIp(uint32_t ipNetOrder) {
+    const std::scoped_lock lock(hostMapMutex);
+    if (const auto it = ipToHost.find(ipNetOrder); it != ipToHost.end()) {
+        return it->second;
+    }
+    return {};
+}
 
 // Parse socks5://[user[:password]@]host:port. Returns nullopt on anything that
 // is not a well-formed socks5 URL with both a host and a port.
@@ -217,7 +259,7 @@ bool ProxyConnect(SOCKET s, const sockaddr_in& proxy) {
 // Perform the SOCKS5 greeting / optional auth / CONNECT on the already-proxy-
 // connected socket `s`, asking the proxy to reach `dest` (an already-resolved
 // IPv4 endpoint - the game does its own DNS).
-bool Handshake(SOCKET s, const ProxyConfig& cfg, const sockaddr_in& dest) {
+bool Handshake(SOCKET s, const ProxyConfig& cfg, const sockaddr_in& dest, std::string_view host) {
     const bool useAuth = !cfg.username.empty();
 
     // Greeting: VER, NMETHODS, METHODS... (offer no-auth, plus user/pass when we have credentials).
@@ -264,15 +306,22 @@ bool Handshake(SOCKET s, const ProxyConfig& cfg, const sockaddr_in& dest) {
         return false;  // 0xFF (no acceptable methods) or anything unexpected
     }
 
-    // CONNECT request: VER, CMD, RSV, ATYP=IPv4, DST.ADDR(4), DST.PORT(2). Both
-    // address and port are already in network byte order inside sockaddr_in.
-    std::array<uint8_t, 10> request{};
-    request[0] = SOCKS5_VERSION;
-    request[1] = SOCKS5_CMD_CONNECT;
-    request[2] = SOCKS5_RSV;
-    request[3] = SOCKS5_ATYP_IPV4;
-    std::memcpy(&request[4], &dest.sin_addr, 4);
-    std::memcpy(&request[8], &dest.sin_port, 2);
+    // CONNECT request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT (port already in
+    // network byte order). When we know the hostname the game resolved for this IP
+    // we send ATYP=DOMAIN so the proxy resolves it in its own region (remote DNS,
+    // like Proxifier); otherwise we fall back to the resolved IPv4.
+    std::vector<uint8_t> request{SOCKS5_VERSION, SOCKS5_CMD_CONNECT, SOCKS5_RSV};
+    if (!host.empty() && host.size() <= SOCKS5_MAX_FIELD) {
+        request.push_back(SOCKS5_ATYP_DOMAIN);
+        request.push_back(static_cast<uint8_t>(host.size()));
+        request.insert(request.end(), host.begin(), host.end());
+    } else {
+        request.push_back(SOCKS5_ATYP_IPV4);
+        const auto* addr = reinterpret_cast<const uint8_t*>(&dest.sin_addr);
+        request.insert(request.end(), addr, addr + 4);
+    }
+    const auto* portBytes = reinterpret_cast<const uint8_t*>(&dest.sin_port);
+    request.insert(request.end(), portBytes, portBytes + 2);
     if (!SendAll(s, request)) {
         return false;
     }
@@ -369,20 +418,58 @@ int WSAAPI HookedConnect(SOCKET s, const sockaddr* name, int namelen) {
     char ipbuf[INET_ADDRSTRLEN]{};
     inet_ntop(AF_INET, &dest.sin_addr, ipbuf, sizeof(ipbuf));
     const uint16_t dport = ntohs(dest.sin_port);
-    logger->info("[diag] CONNECT -> {}:{}", ipbuf, dport);
+
+    // Prefer remote DNS: if the game resolved a hostname for this IP, hand the
+    // hostname to the proxy (ATYP=DOMAIN) so it picks a server in its own region.
+    const std::string host = HostForIp(dest.sin_addr.s_addr);
+    if (host.empty()) {
+        logger->info("[diag] CONNECT -> {}:{} (IPv4)", ipbuf, dport);
+    } else {
+        logger->info("[diag] CONNECT -> {}:{} (remote DNS, resolved locally to {})", host, dport, ipbuf);
+    }
 
     if (!ProxyConnect(s, *proxy)) {
         logger->warn("[diag] proxy dial FAILED for {}:{} via {}:{}", ipbuf, dport, config->host, config->port);
         WSASetLastError(WSAECONNREFUSED);
         return SOCKET_ERROR;
     }
-    if (!Handshake(s, *config, dest)) {
-        logger->warn("[diag] SOCKS5 handshake FAILED for {}:{} via {}:{}", ipbuf, dport, config->host, config->port);
+    if (!Handshake(s, *config, dest, host)) {
+        logger->warn("[diag] SOCKS5 handshake FAILED for {} ({}:{}) via {}:{}", host.empty() ? ipbuf : host.c_str(), ipbuf,
+                     dport, config->host, config->port);
         WSASetLastError(WSAECONNREFUSED);
         return SOCKET_ERROR;
     }
-    logger->info("[diag] tunnel established -> {}:{}", ipbuf, dport);
+    logger->info("[diag] tunnel established -> {}:{}", host.empty() ? ipbuf : host.c_str(), dport);
     return 0;  // tunnel established; the socket is now wired through to dest
+}
+
+// Detoured resolvers: run the real lookup, then record every IPv4 -> hostname so
+// HookedConnect can later send the hostname to the proxy. Pure observation; the
+// game still sees exactly the addresses the OS returned.
+int WSAAPI HookedGetAddrInfo(PCSTR node, PCSTR service, const ADDRINFOA* hints, PADDRINFOA* result) {
+    const int rc = realGetAddrInfo(node, service, hints, result);
+    if (rc == 0 && node != nullptr && result != nullptr && !IsNumericHost(node)) {
+        for (const ADDRINFOA* p = *result; p != nullptr; p = p->ai_next) {
+            if (p->ai_family == AF_INET && p->ai_addr != nullptr && p->ai_addrlen >= sizeof(sockaddr_in)) {
+                const auto* sin = reinterpret_cast<const sockaddr_in*>(p->ai_addr);
+                RememberHost(sin->sin_addr.s_addr, node);
+            }
+        }
+    }
+    return rc;
+}
+
+hostent* WSAAPI HookedGetHostByName(const char* name) {
+    hostent* he = realGetHostByName(name);
+    if (he != nullptr && name != nullptr && he->h_addrtype == AF_INET && he->h_length == 4 && he->h_addr_list != nullptr &&
+        !IsNumericHost(name)) {
+        for (int i = 0; he->h_addr_list[i] != nullptr; ++i) {
+            uint32_t ip = 0;
+            std::memcpy(&ip, he->h_addr_list[i], sizeof(ip));
+            RememberHost(ip, name);
+        }
+    }
+    return he;
 }
 
 }  // namespace
@@ -422,16 +509,22 @@ void Install() {
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    // Detour the WS2_32 `connect` export. It is the same export the game imports, so
-    // hooking it catches the game's connects without depending on any build-specific
-    // address. realConnect becomes the trampoline (the original connect).
+    // Detour the WS2_32 `connect` export plus the resolvers (`getaddrinfo`,
+    // `gethostbyname`). connect catches the game's connects; the resolvers feed the
+    // IP->hostname map that lets us send ATYP=DOMAIN (remote DNS). They are the same
+    // exports the game imports, so no build-specific addresses are needed. The
+    // real* pointers become the trampolines (the originals).
     realConnect = connect;
+    realGetAddrInfo = getaddrinfo;
+    realGetHostByName = gethostbyname;
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourAttach(reinterpret_cast<PVOID*>(&realConnect), reinterpret_cast<PVOID>(&HookedConnect));
+    DetourAttach(reinterpret_cast<PVOID*>(&realGetAddrInfo), reinterpret_cast<PVOID>(&HookedGetAddrInfo));
+    DetourAttach(reinterpret_cast<PVOID*>(&realGetHostByName), reinterpret_cast<PVOID>(&HookedGetHostByName));
     const LONG err = DetourTransactionCommit();
     if (err != NO_ERROR) {
-        logger->error("Detours attach on connect failed ({}); proxy disabled", err);
+        logger->error("Detours attach failed ({}); proxy disabled", err);
         config.reset();
         WSACleanup();
         return;
@@ -448,15 +541,21 @@ void Remove() {
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourDetach(reinterpret_cast<PVOID*>(&realConnect), reinterpret_cast<PVOID>(&HookedConnect));
+    DetourDetach(reinterpret_cast<PVOID*>(&realGetAddrInfo), reinterpret_cast<PVOID>(&HookedGetAddrInfo));
+    DetourDetach(reinterpret_cast<PVOID*>(&realGetHostByName), reinterpret_cast<PVOID>(&HookedGetHostByName));
     const LONG err = DetourTransactionCommit();
     if (err != NO_ERROR) {
-        logger->error("Detours detach on connect failed ({})", err);
+        logger->error("Detours detach failed ({})", err);
     }
 
     installed = false;
     {
         const std::scoped_lock lock(resolveMutex);
         resolvedProxy.reset();
+    }
+    {
+        const std::scoped_lock lock(hostMapMutex);
+        ipToHost.clear();
     }
     config.reset();
     WSACleanup();
