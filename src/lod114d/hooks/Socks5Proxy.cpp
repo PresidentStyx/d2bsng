@@ -7,6 +7,7 @@
 //
 #include <Windows.h>
 #include <detours/detours.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
 #include <array>
@@ -337,6 +338,11 @@ int WSAAPI HookedConnect(SOCKET s, const sockaddr* name, int namelen) {
                                 (b1 == 172 && (b2 & 0xF0) == 16) ||  // 172.16.0.0/12
                                 (b1 == 192 && b2 == 168);            // 192.168.0.0/16
         if (loopback || linkLocal || privateNet) {
+            char ipb[INET_ADDRSTRLEN]{};
+            inet_ntop(AF_INET, &dst->sin_addr, ipb, sizeof(ipb));
+            if (logger) {
+                logger->info("[diag] BYPASS local -> {}:{}", ipb, ntohs(dst->sin_port));
+            }
             return realConnect(s, name, namelen);
         }
     }
@@ -360,11 +366,22 @@ int WSAAPI HookedConnect(SOCKET s, const sockaddr* name, int namelen) {
     sockaddr_in dest{};
     std::memcpy(&dest, name, sizeof(dest));
 
-    if (!ProxyConnect(s, *proxy) || !Handshake(s, *config, dest)) {
-        logger->warn("tunnel via {}:{} failed", config->host, config->port);
+    char ipbuf[INET_ADDRSTRLEN]{};
+    inet_ntop(AF_INET, &dest.sin_addr, ipbuf, sizeof(ipbuf));
+    const uint16_t dport = ntohs(dest.sin_port);
+    logger->info("[diag] CONNECT -> {}:{}", ipbuf, dport);
+
+    if (!ProxyConnect(s, *proxy)) {
+        logger->warn("[diag] proxy dial FAILED for {}:{} via {}:{}", ipbuf, dport, config->host, config->port);
         WSASetLastError(WSAECONNREFUSED);
         return SOCKET_ERROR;
     }
+    if (!Handshake(s, *config, dest)) {
+        logger->warn("[diag] SOCKS5 handshake FAILED for {}:{} via {}:{}", ipbuf, dport, config->host, config->port);
+        WSASetLastError(WSAECONNREFUSED);
+        return SOCKET_ERROR;
+    }
+    logger->info("[diag] tunnel established -> {}:{}", ipbuf, dport);
     return 0;  // tunnel established; the socket is now wired through to dest
 }
 
@@ -380,6 +397,18 @@ void Install() {
     // default logger's sinks on first use; calling it here (after Framework's
     // SetupLogging, well before any connect) is late enough to catch them.
     logger = utils::GetLogger("socks5");
+
+    // [diag] dedicated on-disk sink so a stalled login (which never reaches the
+    // script logger) still leaves a reliable per-connection trace. Appends; the
+    // %P process-id in the pattern keeps concurrent instances distinguishable.
+    try {
+        auto diag = std::make_shared<spdlog::sinks::basic_file_sink_mt>("C:/Kolbot/kolbot/d2bs/logs/socks5-diag.log", false);
+        diag->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [pid %P] %v");
+        logger->sinks().push_back(diag);
+        logger->set_level(spdlog::level::trace);
+        logger->flush_on(spdlog::level::trace);
+    } catch (...) {  // NOLINT(bugprone-empty-catch) - diagnostics are best-effort
+    }
 
     auto parsed = ParseProxyUrl(*opts.proxy);
     if (!parsed) {
