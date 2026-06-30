@@ -34,6 +34,8 @@ namespace {
 using ConnectFn = int(WSAAPI*)(SOCKET, const sockaddr*, int);
 using GetAddrInfoFn = int(WSAAPI*)(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA*);
 using GetHostByNameFn = hostent*(WSAAPI*)(const char*);
+using GetPeerNameFn = int(WSAAPI*)(SOCKET, sockaddr*, int*);
+using CloseSocketFn = int(WSAAPI*)(SOCKET);
 
 // Bound every blocking step of the handshake. The game's own BNCS socket carries a
 // 3s SO_RCVTIMEO, so this is only the outer ceiling for the proxy itself.
@@ -64,6 +66,8 @@ struct ProxyConfig {
 ConnectFn realConnect = nullptr;  // set in Install(); Detours rewrites it to the trampoline (original connect)
 GetAddrInfoFn realGetAddrInfo = nullptr;     // trampoline to the original getaddrinfo
 GetHostByNameFn realGetHostByName = nullptr; // trampoline to the original gethostbyname
+GetPeerNameFn realGetPeerName = nullptr;     // trampoline to the original getpeername
+CloseSocketFn realCloseSocket = nullptr;     // trampoline to the original closesocket
 bool installed = false;
 std::shared_ptr<spdlog::logger> logger;  // dedicated "socks5" logger; created in Install() once the sinks are wired
 
@@ -79,6 +83,15 @@ std::optional<sockaddr_in> resolvedProxy;  // proxy endpoint, resolved lazily an
 // CONNECT so the proxy re-resolves it locally. Numeric "hostnames" are not recorded.
 std::mutex hostMapMutex;
 std::unordered_map<uint32_t, std::string> ipToHost;  // key: IPv4 in network byte order
+
+// Sockets we tunnelled, mapped to the destination the game *asked* for. Because the
+// socket is really connected to the SOCKS5 proxy, an un-hooked getpeername() would
+// report the proxy's address - and the game uses that to open follow-up connections
+// (BnFTP version download / realm) to <peer-ip>:6112, hitting the proxy's own IP and
+// stalling. Reporting the original destination keeps the game's view consistent with
+// a transparent proxifier, so those follow-ups re-tunnel correctly.
+std::mutex peerMapMutex;
+std::unordered_map<SOCKET, sockaddr_in> peerMap;
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 // True if `s` is a dotted-quad / numeric literal rather than a real hostname; we must
@@ -439,8 +452,39 @@ int WSAAPI HookedConnect(SOCKET s, const sockaddr* name, int namelen) {
         WSASetLastError(WSAECONNREFUSED);
         return SOCKET_ERROR;
     }
+    {
+        const std::scoped_lock lock(peerMapMutex);
+        peerMap[s] = dest;  // so getpeername() reports the real server, not the proxy
+    }
     logger->info("[diag] tunnel established -> {}:{}", host.empty() ? ipbuf : host.c_str(), dport);
     return 0;  // tunnel established; the socket is now wired through to dest
+}
+
+// getpeername on a tunnelled socket would return the proxy's address (the socket's
+// true peer). Report the destination the game requested instead, so follow-up
+// connections the game derives from the peer address target the real server.
+int WSAAPI HookedGetPeerName(SOCKET s, sockaddr* name, int* namelen) {
+    {
+        const std::scoped_lock lock(peerMapMutex);
+        if (const auto it = peerMap.find(s); it != peerMap.end()) {
+            if (name != nullptr && namelen != nullptr && *namelen >= static_cast<int>(sizeof(sockaddr_in))) {
+                std::memcpy(name, &it->second, sizeof(sockaddr_in));
+                *namelen = sizeof(sockaddr_in);
+                return 0;
+            }
+        }
+    }
+    return realGetPeerName(s, name, namelen);
+}
+
+// Drop the peer mapping when the socket closes so a reused descriptor can't inherit
+// a stale tunnelled peer.
+int WSAAPI HookedCloseSocket(SOCKET s) {
+    {
+        const std::scoped_lock lock(peerMapMutex);
+        peerMap.erase(s);
+    }
+    return realCloseSocket(s);
 }
 
 // Detoured resolvers: run the real lookup, then record every IPv4 -> hostname so
@@ -517,11 +561,15 @@ void Install() {
     realConnect = connect;
     realGetAddrInfo = getaddrinfo;
     realGetHostByName = gethostbyname;
+    realGetPeerName = getpeername;
+    realCloseSocket = closesocket;
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourAttach(reinterpret_cast<PVOID*>(&realConnect), reinterpret_cast<PVOID>(&HookedConnect));
     DetourAttach(reinterpret_cast<PVOID*>(&realGetAddrInfo), reinterpret_cast<PVOID>(&HookedGetAddrInfo));
     DetourAttach(reinterpret_cast<PVOID*>(&realGetHostByName), reinterpret_cast<PVOID>(&HookedGetHostByName));
+    DetourAttach(reinterpret_cast<PVOID*>(&realGetPeerName), reinterpret_cast<PVOID>(&HookedGetPeerName));
+    DetourAttach(reinterpret_cast<PVOID*>(&realCloseSocket), reinterpret_cast<PVOID>(&HookedCloseSocket));
     const LONG err = DetourTransactionCommit();
     if (err != NO_ERROR) {
         logger->error("Detours attach failed ({}); proxy disabled", err);
@@ -543,6 +591,8 @@ void Remove() {
     DetourDetach(reinterpret_cast<PVOID*>(&realConnect), reinterpret_cast<PVOID>(&HookedConnect));
     DetourDetach(reinterpret_cast<PVOID*>(&realGetAddrInfo), reinterpret_cast<PVOID>(&HookedGetAddrInfo));
     DetourDetach(reinterpret_cast<PVOID*>(&realGetHostByName), reinterpret_cast<PVOID>(&HookedGetHostByName));
+    DetourDetach(reinterpret_cast<PVOID*>(&realGetPeerName), reinterpret_cast<PVOID>(&HookedGetPeerName));
+    DetourDetach(reinterpret_cast<PVOID*>(&realCloseSocket), reinterpret_cast<PVOID>(&HookedCloseSocket));
     const LONG err = DetourTransactionCommit();
     if (err != NO_ERROR) {
         logger->error("Detours detach failed ({})", err);
@@ -556,6 +606,10 @@ void Remove() {
     {
         const std::scoped_lock lock(hostMapMutex);
         ipToHost.clear();
+    }
+    {
+        const std::scoped_lock lock(peerMapMutex);
+        peerMap.clear();
     }
     config.reset();
     WSACleanup();
