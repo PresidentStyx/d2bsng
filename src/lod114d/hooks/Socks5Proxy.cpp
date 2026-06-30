@@ -319,6 +319,28 @@ int WSAAPI HookedConnect(SOCKET s, const sockaddr* name, int namelen) {
         namelen < static_cast<int>(sizeof(sockaddr_in)) || name->sa_family != AF_INET) {
         return realConnect(s, name, namelen);
     }
+
+    // Loopback / private / link-local destinations are never tunnelled: they
+    // belong to this machine or the local network, not the remote SOCKS5 peer.
+    // During Battle.net login the game makes a 127.0.0.1 self-connection; routing
+    // that to the proxy (whose own localhost has nothing listening) fails closed
+    // and hangs the client on "Checking versions". System proxifiers bypass these
+    // ranges for the same reason.
+    {
+        const auto* dst = reinterpret_cast<const sockaddr_in*>(name);
+        const uint32_t hostOrder = ntohl(dst->sin_addr.s_addr);
+        const auto b1 = static_cast<uint8_t>(hostOrder >> 24);
+        const auto b2 = static_cast<uint8_t>((hostOrder >> 16) & 0xFF);
+        const bool loopback = b1 == 127;                              // 127.0.0.0/8
+        const bool linkLocal = b1 == 169 && b2 == 254;               // 169.254.0.0/16
+        const bool privateNet = b1 == 10 ||                          // 10.0.0.0/8
+                                (b1 == 172 && (b2 & 0xF0) == 16) ||  // 172.16.0.0/12
+                                (b1 == 192 && b2 == 168);            // 192.168.0.0/16
+        if (loopback || linkLocal || privateNet) {
+            return realConnect(s, name, namelen);
+        }
+    }
+
     int sockType = 0;
     int optLen = sizeof(sockType);
     if (getsockopt(s, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&sockType), &optLen) != 0 ||
