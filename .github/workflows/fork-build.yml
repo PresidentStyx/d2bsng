@@ -1,0 +1,78 @@
+name: Fork Build
+
+# Self-contained Release build for this fork: produces a downloadable d2bs.dll
+# artifact without any local toolchain. Mirrors ci-build.yml's build job but
+# triggers on push / manual dispatch and pulls the prebuilt V8 monolith from the
+# UPSTREAM release (the fork has no v8-14.0.264.0 release of its own).
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+      VCPKG_REF: 74e6536215718009aae747d86d84b78376bf9e09
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-${{ runner.os }}-${{ env.VCPKG_REF }}-${{ hashFiles('vcpkg.json', 'tests/framework/vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-${{ env.VCPKG_REF }}-
+
+      - name: Set up pinned vcpkg
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $vcpkgDir = "$env:RUNNER_TEMP\vcpkg"
+          git clone --quiet https://github.com/microsoft/vcpkg.git $vcpkgDir
+          git -C $vcpkgDir checkout --quiet $env:VCPKG_REF
+          & "$vcpkgDir\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap failed" }
+          & "$vcpkgDir\vcpkg.exe" integrate install
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg integrate failed" }
+          "VCPKG_ROOT=$vcpkgDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Fetch V8 monolith libs (from upstream release)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force dependencies/v8/libs | Out-Null
+          gh release download v8-14.0.264.0 --repo ResurrectedTrader/d2bsng -p v8-libs.zip -O v8-libs.zip
+          Expand-Archive -Force v8-libs.zip dependencies/v8/libs
+
+      - name: Build (Release)
+        shell: pwsh
+        run: .\build.ps1 Release
+
+      - name: Collect artifact
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Recurse -Filter d2bs.dll | Where-Object { $_.FullName -notmatch 'vcpkg' } | Select-Object -First 1
+          if (-not $dll) { throw "d2bs.dll not found after build" }
+          Write-Host "Found: $($dll.FullName)  ($([math]::Round($dll.Length/1MB,2)) MB)"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $dll.FullName out\
+          $pdb = Get-ChildItem -Recurse -Filter d2bs.pdb | Where-Object { $_.FullName -notmatch 'vcpkg' } | Select-Object -First 1
+          if ($pdb) { Copy-Item $pdb.FullName out\ }
+
+      - name: Upload d2bs.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: d2bs-dll
+          if-no-files-found: error
+          path: out/
