@@ -57,7 +57,11 @@ jobs:
 
       - name: Build (Release)
         shell: pwsh
-        run: .\build.ps1 Release
+        # Bake an explicit fork version into the DLL (shown in the in-game banner,
+        # bottom-right) instead of the 2.0.0-dev fallback. This fork adds the working
+        # SOCKS5 proxy, per-connection proxy logging, and the native Dropper on top of
+        # the 2.0.0 baseline.
+        run: .\build.ps1 Release -Version 2.1.0
 
       - name: Collect artifact
         shell: pwsh
